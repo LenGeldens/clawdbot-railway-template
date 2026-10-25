@@ -36,7 +36,7 @@ Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
 
 Notes:
-- This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
+- This template builds an official release pinned by both `OPENCLAW_GIT_REF` and immutable `OPENCLAW_GIT_SHA`. Node and Bun base images are pinned by version and digest. The wrapper keeps `/data` and the internal loopback gateway.
 
 4) Enable **Public Networking** (HTTP). Railway will assign a domain.
    - This service listens on Railway’s injected `PORT` at runtime (recommended).
@@ -149,18 +149,39 @@ If you see warnings about deprecated `CLAWDBOT_*` variables or state dir split-b
 - Ensure `OPENCLAW_STATE_DIR=/data/.openclaw` and `OPENCLAW_WORKSPACE_DIR=/data/workspace`
 - Redeploy after fixing Railway Variables
 
-### Build OOM (out of memory) on Railway
+### Updating OpenClaw
 
-Building OpenClaw from source can exceed small memory tiers.
+The build uses the release's unchanged manifests and frozen pnpm lockfile. A single
+`pnpm build` produces the gateway, Control UI and external plugin runtimes including
+WhatsApp. Do not add another `pnpm ui:build` in a later Docker layer: the UI's atomic
+directory rename can fail with `EXDEV` against an output from an earlier layer.
+The wrapper uses `npm ci`; runtime pnpm comes from OpenClaw's `packageManager` field.
 
-Recommendations:
-- Use a plan with **2GB+ memory**.
-- If you see `Reached heap limit Allocation failed - JavaScript heap out of memory`, upgrade memory and redeploy.
+`node scripts/bump-openclaw-ref.mjs` proposes the latest stable release and verifies
+its commit SHA. `node scripts/bump-openclaw-ref.mjs --check`
+verifies the current pin without editing it. Review release migrations, back up the
+volume and pass the Docker build/smoke workflow before merging an update. The
+scheduled workflow opens a PR; it does not merge or deploy automatically. PRs made
+with `GITHUB_TOKEN` may need the Docker build workflow started manually.
+
+The wrapper runs from `/app` and uses the same `/openclaw/openclaw.mjs` launcher as
+the CLI. The template retains its existing root UID for existing volume ownership.
+Perform any release-required migration after a private backup, with only one
+gateway using the volume. Source builds need more resources than prebuilt images;
+do not increase a Railway budget without the owner's approval.
+
+The official prebuilt image was considered, but its default release bundles Codex
+and diagnostics while omitting the external WhatsApp runtime. Keeping the source
+layout avoids a separate plugin-installation/configuration migration here.
 
 ## Local smoke test
 
 ```bash
 docker build -t clawdbot-railway-template .
+
+# Real installation, gateway, HTTP/auth and restart/persistence checks.
+# Creates and removes its own disposable Docker volume; never use production data.
+node scripts/container-smoke.mjs clawdbot-railway-template
 
 docker run --rm -p 8080:8080 \
   -e PORT=8080 \
@@ -172,6 +193,10 @@ docker run --rm -p 8080:8080 \
 
 # open http://localhost:8080/setup (password: test)
 ```
+
+The container smoke does not log into a provider or WhatsApp, send a message, or
+prove account/model access. Those checks are separate from a successful image
+build and must use the actual account after deployment.
 
 ---
 

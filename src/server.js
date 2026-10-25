@@ -75,8 +75,8 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT 
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
-// Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
-const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
+// Use OpenClaw's supported launcher so its runtime bootstrap is applied.
+const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/openclaw.mjs";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 function clawArgs(args) {
@@ -151,21 +151,7 @@ async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    try {
-      // Try the default Control UI base path, then fall back to root.
-      const paths = ["/openclaw", "/"];
-      for (const p of paths) {
-        try {
-          const res = await fetch(`${GATEWAY_TARGET}${p}`, { method: "GET" });
-          // Any HTTP response means the port is open.
-          if (res) return true;
-        } catch {
-          // try next
-        }
-      }
-    } catch {
-      // not ready
-    }
+    if (await probeGateway(Math.min(1_500, timeoutMs - (Date.now() - start)))) return true;
     await sleep(250);
   }
   return false;
@@ -191,7 +177,7 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
-  gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
+  const proc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
@@ -199,19 +185,20 @@ async function startGateway() {
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
     },
   });
+  gatewayProc = proc;
 
-  gatewayProc.on("error", (err) => {
+  proc.on("error", (err) => {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
-    gatewayProc = null;
+    if (gatewayProc === proc) gatewayProc = null;
   });
 
-  gatewayProc.on("exit", (code, signal) => {
+  proc.on("exit", (code, signal) => {
     const msg = `[gateway] exited code=${code} signal=${signal}`;
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
-    gatewayProc = null;
+    if (gatewayProc === proc) gatewayProc = null;
   });
 }
 
@@ -232,7 +219,11 @@ async function runDoctorBestEffort() {
 
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
-  if (gatewayProc) return { ok: true };
+  if (gatewayStarting) {
+    await gatewayStarting;
+    return { ok: true };
+  }
+  if (gatewayProc && await probeGateway()) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       try {
@@ -299,60 +290,42 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-// Minimal health endpoint for Railway.
-app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
-
-async function probeGateway() {
-  // Don't assume HTTP — the gateway primarily speaks WebSocket.
-  // A simple TCP connect check is enough for "is it up".
-  const net = await import("node:net");
-
-  return await new Promise((resolve) => {
-    const sock = net.createConnection({
-      host: INTERNAL_GATEWAY_HOST,
-      port: INTERNAL_GATEWAY_PORT,
-      timeout: 750,
+async function probeGateway(timeoutMs = 1_500) {
+  try {
+    // OpenClaw /readyz checks startup and subsystem readiness. An open TCP port,
+    // a login page, or even a successful Control UI response does not prove this.
+    const response = await fetch(`${GATEWAY_TARGET}/readyz`, {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      return false;
+    }
+    const body = await response.json();
+    return body?.ready === true;
+  } catch {
+    return false;
+  }
+}
 
-    const done = (ok) => {
-      try { sock.destroy(); } catch {}
-      resolve(ok);
-    };
-
-    sock.on("connect", () => done(true));
-    sock.on("timeout", () => done(false));
-    sock.on("error", () => done(false));
+// A fresh installation must remain reachable for onboarding. Once configured,
+// Railway should only promote a deployment when the gateway is actually ready.
+// Both public endpoints expose booleans only; diagnostics stay behind setup auth.
+async function healthCheck(_req, res) {
+  const configured = isConfigured();
+  const ready = configured && await probeGateway();
+  const ok = !configured || ready;
+  res.set("Cache-Control", "no-store").status(ok ? 200 : 503).json({
+    ok,
+    wrapper: { configured },
+    gateway: { ready },
   });
 }
 
-// Public health endpoint (no auth) so Railway can probe without /setup.
-// Keep this free of secrets.
-app.get("/healthz", async (_req, res) => {
-  let gatewayReachable = false;
-  if (isConfigured()) {
-    try {
-      gatewayReachable = await probeGateway();
-    } catch {
-      gatewayReachable = false;
-    }
-  }
-
-  res.json({
-    ok: true,
-    wrapper: {
-      configured: isConfigured(),
-      stateDir: STATE_DIR,
-      workspaceDir: WORKSPACE_DIR,
-    },
-    gateway: {
-      target: GATEWAY_TARGET,
-      reachable: gatewayReachable,
-      lastError: lastGatewayError,
-      lastExit: lastGatewayExit,
-      lastDoctorAt,
-    },
-  });
-});
+app.get("/setup/healthz", healthCheck);
+app.get("/healthz", healthCheck);
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
   // Serve JS for /setup (kept external to avoid inline encoding/template issues)
