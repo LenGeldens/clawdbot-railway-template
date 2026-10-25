@@ -95,6 +95,77 @@ versiecontrole alleen bewijst niet welke installatie de wrapper start.
 
 ## 3. Migreer bestaande Codex-auth en configuratie
 
+**De bestaande versie 2026.3.8 valt buiten het directe upgradevenster.** De
+release-instructies schrijven voor installaties van vóór juli 2026 eerst
+2026.9.5 en zijn Doctor-migraties voor. Versie 2026.10.7 importeert onder meer
+`credentials/oauth.json`, `plugins/installs.json`, oude task-/flow-/plugin-
+databases en sommige oude configuratiesleutels niet meer. Ook 2026.9.7 verwijst
+voor deze oudere bronnen naar 2026.9.5; 2026.9.7 is geen universele vervanging.
+Sommige resterende runtime-JSON-bestanden, sandboxregistries of een oud
+geheugenindexschema vragen daarnaast expliciet om 2026.9.7. Volg de gemelde
+bron en bridgeversie, met een nieuw controlepunt tussen de stappen.
+
+Inspecteer vóór een eerste schrijvende start alleen de aanwezigheid van deze
+bronnen en de betreffende configuratiesleutels, zonder credentials te tonen.
+Voer de bridge in de gestopte container tegen dezelfde paden uit, met een
+afzonderlijk vastgelegde CLI-versie en de benodigde kanaalplugins. Een
+nieuwe CLI bovenop al door 2026.10.7 gemigreerde databases terugzetten is geen
+veilige bridge: herstel dan eerst de volledige passende oude back-up.
+
+Gateway-startup importeert algemene legacy-state **niet**; dat doet Doctor.
+De officiële OpenClaw-image voert Doctor in zijn entrypoint uit, maar deze
+Railway-wrapper heeft een eigen entrypoint. Een niet-interactieve gateway-start
+kan daarom met exit 78 weigeren en `/setup/healthz` ongezond laten. Gebruik een
+expliciete, gecontroleerde migratie vóór de eerste gatewaystart; vertrouw niet
+op een console die pas na een geslaagde deployment beschikbaar komt. Een
+Railway pre-deploy command is hiervoor ongeschikt: dat heeft geen volume-mount.
+
+### Eenmalige migratie in deze Railway-image
+
+Voor de gecontroleerde route 2026.3.8 → 2026.9.5 → 2026.10.7 bevat deze image
+een afzonderlijke, vastgepinde 2026.9.5 CLI onder
+`/opt/openclaw-bridge/node_modules/openclaw/openclaw.mjs`. Schakel de
+pre-startstap uitsluitend na controle van het herstelpunt expliciet in met:
+
+```text
+OPENCLAW_MIGRATION=2026.10.7-from-prejuly
+```
+
+De wrapper wacht hiermee vóór bootstrap, configwijzigingen en gatewaystart.
+De stap controleert de exacte CLI-versies en een vrije interne gatewaypoort,
+archiveert de complete gestopte state en workspace inclusief aanwezige
+SQLite-sidecars en controleert het tar-archief. Daarna voert hij eerst de
+bridge-Doctor en configvalidatie uit en vervolgens dezelfde stappen met
+2026.10.7. Hij kiest geen model en voert geen modelaanvraag uit.
+
+Offline onderhoud betekent hier dat de gateway en andere schrijvers gestopt
+zijn; het betekent niet dat netwerktoegang uitstaat. Doctor kan een verlopen
+of bijna verlopen OAuth-login vernieuwen. Bewaar daarom ook de nieuwste state
+bij een rollback: tokenrotatie kan de in de oude back-up bewaarde refresh-token
+ongeldig maken. Controleer na herstel eerst de bestaande login; gebruik pas
+bij een aangetoonde authenticatiefout de officiële loginprocedure hieronder.
+
+Archief, checksum, fasejournal en privélog staan onder
+`/data/backups/openclaw-2026.10.7-from-prejuly/`. Directoryrechten zijn 0700;
+archief, log en journal zijn 0600. Standaard worden alleen fasemeldingen
+naar Railway-logs geschreven, geen Doctor-uitvoer. De ondersteunde automatische
+layout heeft state en workspace als aparte directories direct onder hetzelfde
+volume; afwijkende externe paden vereisen gerichte handmatige onderhoudsstappen.
+
+Alleen nadat beide Doctor-runs en beide configvalidaties exit 0 hebben,
+krijgen de state-directory en het externe journal bij elkaar horende
+afrondingsbewijzen. Latere starts slaan de migratie over. Een onderbroken of
+mislukte fase blokkeert automatisch herhalen: inspecteer het privélog en het
+journal. Start nooit 2026.9.5 opnieuw op deels door 2026.10.7 geschreven state.
+Er is geen automatische restore en geen automatisch wissen van een journal.
+Een door Doctor genoemde 2026.9.7-verplichting blijft een expliciete
+onderhoudsstap; de helper slaat die fout niet over.
+
+Verwijder de opt-in na succesvolle migratie en controles. Stel de eerste
+deployment-healthcheck ruim genoeg in voor back-up plus beide migraties.
+`stage: "complete"` bewijst alleen deze migratiestappen; gateway, abonnement,
+model, WhatsApp en persistentie moeten hieronder nog afzonderlijk worden getest.
+
 Voer dit pas uit na het gecontroleerde herstelpunt. Stop gedurende een
 opslagmigratie de actieve gateway via de wrapper/procesbeheerder, zodat deze
 niet direct opnieuw start. Gebruik geen tweede gateway op hetzelfde volume.
@@ -105,6 +176,13 @@ openclaw config validate
 openclaw models auth list --agent main --provider openai --json
 openclaw models auth order get --agent main --provider openai
 ```
+
+Voor de gecontroleerde headless stap zijn de ondersteunde opties
+`openclaw doctor --fix --non-interactive --no-workspace-suggestions`.
+Combineer deze reparatie niet met `--json`: dat selecteert de read-only
+lintmodus en wordt samen met `--fix` geweigerd. Gebruik geen `--force`,
+`--yes` of `--generate-gateway-token`. Controleer exitstatus én de resterende
+waarschuwingen; exit 0 is nog geen bewijs van modeltoegang of kanaalgezondheid.
 
 Lees de reparatie-uitvoer. In deze release migreert doctor oude `codex/*` en
 `openai-codex/*` modelverwijzingen, auth-profiel-ID's, auth-volgorde en
@@ -220,6 +298,77 @@ per-agent of per-sessie selecties. Controleer daarom ook `agents.entries.main`
 (en eventuele andere werkelijk geconfigureerde agent), modelpolicy,
 fallbacks, thinking-overrides en de opgeslagen WhatsApp-sessie.
 
+In **2026.10.7** is `agents.entries.<id>` de actuele schema-vorm; `agents.list`
+is legacy. De CLI kan oude list-paden nog vertalen, maar schrijf nieuwe patches
+met `entries`. Zowel `agents.defaults` als een `agents.entries.main`-record
+ondersteunen `model`, `models` en `thinkingDefault`.
+
+Als `main` een eigen model of runtimeoverride heeft, voeg na modelverificatie
+dit deel aan de bovenstaande patch toe:
+
+```json5
+{
+  agents: {
+    entries: {
+      main: {
+        model: { primary: "openai/gpt-6-astra", fallbacks: [] },
+        thinkingDefault: "medium",
+        models: {
+          "openai/gpt-6-astra": { agentRuntime: { id: "codex" } },
+        },
+      },
+    },
+  },
+}
+```
+
+Bewaar de samengestelde patch zonder credentials in een privé tijdelijk
+bestand op de server. De ondersteunde patchwriter merge objecten recursief,
+vervangt arrays en verwijdert paden bij `null`. Laat `channels`, `bindings` en
+gatewaybeveiliging buiten deze modelpatch:
+
+```sh
+openclaw config patch --file /tmp/openclaw-route.patch.json --dry-run
+openclaw config patch --file /tmp/openclaw-route.patch.json
+openclaw config validate --json
+```
+
+Controleer een bestaande modelpolicy afzonderlijk: voeg alleen het gekozen
+exacte model toe indien nodig, zonder beperkingen op te heffen. Volg de
+herstartmelding van de CLI en vergelijk na toepassing de WhatsApp-policies en
+allowlist met het herstelpunt.
+
+### Machineleesbare catalogus met runtime en redeneerniveaus
+
+De gewone `models list --json` vereenvoudigt de modelregels. Gebruik deze
+RPC wanneer ook de door het account aangeboden redeneerniveaus nodig zijn:
+
+```sh
+openclaw gateway call models.list \
+  --params '{"agentId":"main","provider":"openai","view":"all","refresh":true,"includeDetails":true}' \
+  --timeout 210000 --json
+```
+
+Inspecteer `providerOutcomes`, `refreshFailed` en per model `available`,
+`agentRuntime`, `runtimeChoices`, `thinkingLevels` en `thinkingDefault`.
+Voor het account van een bestaande conversatie kan `sessionKey` aan de
+parameters worden toegevoegd. Een expliciete `authProfileId` kan ook, maar
+mag niet samen met `sessionKey` worden meegegeven.
+
+Het ondersteunde Codex-account-RPC accepteert uitsluitend een opgeslagen
+abonnementslogin en vraagt die op met `authRequirement: "subscription"`:
+
+```sh
+openclaw gateway call codex.accountUsage \
+  --params '{"agentId":"main","profileId":"ECHT_OAUTH_PROFIEL_ID"}' \
+  --timeout 30000 --json
+```
+
+Deze actie vereist `operator.admin`. Gebruik de bestaande lokale
+gateway-authenticatie; plaats geen gatewaytoken op de commandoregel. Het
+resultaat kan privé-account-/quotagegevens bevatten, maar geen credentials.
+Ook dit is accountbewijs, geen bewijs dat de generatieaanvraag slaagt.
+
 ## 5. Test dezelfde gateway en de bestaande WhatsApp-conversatie
 
 Zoek privé de juiste bestaande sessiesleutel, zonder gesprekken te publiceren:
@@ -237,6 +386,21 @@ Bij een bewust aangehechte native thread kan ook zijn opgeslagen model leidend
 zijn; wijzig die gericht via de ondersteunde `/codex model`-bediening en
 controleer de binding opnieuw. Wis geen sessie of geschiedenis om een test
 groen te krijgen.
+
+Voor een gericht herstel zonder extra WhatsApp-commando's ondersteunt deze
+release onderstaande RPC. Vul de werkelijk gevonden key en huidige
+session-ID in; `expectedSessionId` voorkomt dat een inmiddels vervangen
+sessie per ongeluk wordt aangepast:
+
+```sh
+openclaw gateway call sessions.patch \
+  --params '{"key":"ECHTE_WHATSAPP_SESSIESLEUTEL","agentId":"main","expectedSessionId":"HUIDIGE_SESSION_ID","model":null,"agentRuntime":null,"thinkingLevel":null}' \
+  --json
+```
+
+Dit herstelt model/runtime/thinking-selectie naar de configuratie. Het is geen
+reset van de gesprekshistorie en geen bewijs dat een compatibele auth-pin
+verdwenen is. Controleer die accountselectie apart.
 
 Voer nu via de actieve gateway één kleine aanvraag op diezelfde sessie uit.
 Gebruik de werkelijk gevonden sessiesleutel en geef **geen** `--model` mee:
@@ -258,6 +422,15 @@ en `/codex binding` van dezelfde sessie. Het bewijs moet ChatGPT/Codex-
 abonnementsauth tonen; een `openai/`-prefix, een prijsveld of afwezige
 API-keyvariabele alleen is onvoldoende. Als metadata de route niet vaststelt,
 blijft abonnementsauth **niet geverifieerd**.
+
+De gateway-JSON-envelop bevat de runmetadata doorgaans onder
+`result.meta.agentMeta`: lees daar `provider`, `model`, `agentHarnessId`,
+`runtimeModelSelection` en `credentialSource`. In deze release geeft
+`credentialSource.kind: "profile"` bewust geen profiel-ID of credentialtype;
+dat veld alleen bewijst dus geen OAuth. Controleer ook `result.meta.error`,
+`aborted`, de terminale status en eventuele `fallbackAttempts`. Projecteer
+alleen deze benodigde velden en de testtekst voor een opleverrapport; publiceer
+geen volledige prompt-/gespreksdiagnostiek.
 
 Een losse `models status --probe` is geen vervanging voor deze gatewaytest.
 In 2026.10.7 vereist die probe exclusief eigendom van de statedirectory;
@@ -307,6 +480,9 @@ deployment is geen bewijs dat de account Astra kan gebruiken.
 3. Herstel de volledige **bij de oude image horende** state en workspace uit
    het herstelpunt van vóór de upgrade. Herstel naar gecontroleerde paden;
    meng geen nieuwe SQLite-databases of WAL-bestanden met oude state.
+   Bewaar ook het migratiejournal buiten de state-directory apart en schakel
+   `OPENCLAW_MIGRATION` uit. Hergebruik een afgerond journal niet voor oude
+   herstelde state; de state-side receiptcontrole weigert deze combinatie.
 4. Zet de bijbehorende oude image/commit terug in dezelfde service, met
    hetzelfde volume, PORT en toegangsbeleid. Voer met die oude image geen
    migratie van de nieuwe config uit.
@@ -316,6 +492,8 @@ Alleen de image terugzetten is onvoldoende: doctor en database-upgrades kunnen
 de persistente configuratie, profielnamen en opslag veranderen. Meld ook dat
 berichten en bestanden van ná het gekozen herstelpunt niet automatisch in de
 teruggezette toestand zitten; bewaar die nieuwe snapshot voor gericht herstel.
+Een oude auth-back-up garandeert na OAuth-tokenrotatie geen geldige login.
+Controleer die na herstel en deel of kopieer geen tokens via chat of logs.
 
 ## Geverifieerde bronnen
 
@@ -332,7 +510,15 @@ Codex dan de 0.160.0 uit deze tag.
 - [Model- en auth-CLI](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/cli/models.md)
 - [Gateway-agenttest](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/cli/agent.md)
 - [Sessies](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/cli/sessions.md)
+- [Configpatches en agents.entries](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/cli/config.md)
+- [Schema van agentrecords](https://github.com/openclaw/openclaw/blob/v2026.10.7/src/config/zod-schema.agent-entry-base.ts)
+- [Schema van gerichte sessiewijzigingen](https://github.com/openclaw/openclaw/blob/v2026.10.7/packages/gateway-protocol/src/schema/sessions-patch.ts)
+- [Account-RPC met verplichte abonnementsauth](https://github.com/openclaw/openclaw/blob/v2026.10.7/extensions/codex/src/account-usage-runtime.ts)
 - [Back-up en SQLite](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/cli/backup.md)
+- [Upgradevenster en tussenversies](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/install/updating.md#upgrading-very-old-versions)
+- [Legacy-state en entrypoint](https://github.com/openclaw/openclaw/blob/v2026.10.7/docs/cli/doctor/state-migrations.md)
+- [Gateway-startup laat algemene import aan Doctor](https://github.com/openclaw/openclaw/blob/v2026.10.7/src/commands/startup-config-preflight.ts)
+- [Railway pre-deploy heeft geen volume](https://docs.railway.com/deployments/pre-deploy-command)
 - [Live OpenClaw OpenAI-documentatie](https://docs.openclaw.ai/providers/openai)
 - [Officiële OpenAI modeldocumentatie](https://developers.openai.com/codex/models)
 - [Officiële OpenAI authenticatie](https://developers.openai.com/codex/auth)

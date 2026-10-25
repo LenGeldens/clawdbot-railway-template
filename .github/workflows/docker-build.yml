@@ -10,7 +10,7 @@ on:
 jobs:
   docker-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,7 +40,9 @@ jobs:
           load: true
           tags: openclaw-railway-template:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Cache upload is optional; image build and container smoke still fail
+          # the job on any error. Large source layers can make uploads slow.
+          cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Start image and verify gateway and persistence
         run: node scripts/container-smoke.mjs openclaw-railway-template:ci

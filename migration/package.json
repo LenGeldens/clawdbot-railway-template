@@ -1,0 +1,8 @@
+{
+  "name": "openclaw-railway-migration-bridge",
+  "private": true,
+  "description": "Opt-in one-time legacy-state migration bridge; never starts a gateway",
+  "dependencies": {
+    "openclaw": "2026.9.5"
+  }
+}

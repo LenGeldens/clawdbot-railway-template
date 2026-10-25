@@ -34,6 +34,15 @@ if (args[0] === "config" && args[1] === "set") {
   fs.writeFileSync(path.join(state, "fixture.pid"), String(process.pid));
   const server = http.createServer((req, res) => {
     const mode = fs.readFileSync(path.join(state, "fixture-mode"), "utf8");
+    if (req.url === "/control-ui-config.json") {
+      const authorized = req.headers.authorization === "Bearer " + process.env.OPENCLAW_GATEWAY_TOKEN;
+      res.writeHead(authorized ? 200 : 401, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ authorized }));
+    }
+    if (req.url === "/hooks/auth-probe") {
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ preserved: req.headers.authorization === "Basic fixture-webhook" }));
+    }
     if (req.url !== "/readyz") return res.end("fixture control UI");
     if (mode === "hang") return;
     if (mode === "redirect") {
@@ -210,6 +219,25 @@ test("configured wrapper waits for actual readiness and preserves state across r
   assert.equal(response.status, 200);
   assert.equal(await response.text(), "fixture control UI");
   await assertHealth(wrapper, { configured: true, ready: true, status: 200 });
+
+  await t.test("bridges validated dashboard Basic auth for protected gateway HTTP reads", async () => {
+    const bootstrap = await wrapper.request("/control-ui-config.json", { headers: { authorization } });
+    assert.equal(bootstrap.status, 200);
+    assert.deepEqual(await bootstrap.json(), { authorized: true });
+    for (const headers of [
+      {},
+      { authorization: `Basic ${Buffer.from("admin:wrong").toString("base64")}` },
+      { authorization: "Bearer not-the-setup-password" },
+    ]) {
+      assert.equal((await wrapper.request("/control-ui-config.json", { headers })).status, 401);
+    }
+    // Webhooks bypass dashboard authentication and retain their own credentials.
+    const webhook = await wrapper.request("/hooks/auth-probe", {
+      headers: { authorization: "Basic fixture-webhook" },
+    });
+    assert.equal(webhook.status, 200);
+    assert.deepEqual(await webhook.json(), { preserved: true });
+  });
 
   for (const mode of ["unhealthy", "bad-status", "not-ready", "truthy", "html", "malformed", "redirect", "hang"]) {
     await t.test(`does not report ready for ${mode}`, async () => {

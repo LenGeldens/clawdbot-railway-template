@@ -4,8 +4,12 @@
 !Dockerfile
 !package.json
 !package-lock.json
+!migration/
+!migration/package.json
+!migration/package-lock.json
 !src/
 !src/**
 !scripts/
 !scripts/smoke.js
 !scripts/healthcheck.js
+!scripts/migrate-state.mjs

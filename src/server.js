@@ -7,6 +7,7 @@ import path from "node:path";
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
+import { migrateState } from "../scripts/migrate-state.mjs";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -39,6 +40,18 @@ const STATE_DIR =
 const WORKSPACE_DIR =
   process.env.OPENCLAW_WORKSPACE_DIR?.trim() ||
   path.join(STATE_DIR, "workspace");
+
+// Explicit, one-time upgrade for pre-July state. This must run before token,
+// config, bootstrap or gateway writes. A failed migration stops startup.
+await migrateState({
+  env: process.env,
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  node: process.env.OPENCLAW_NODE?.trim() || "node",
+  entry: process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/openclaw.mjs",
+  gatewayPort: Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10),
+  log: console.log,
+});
 
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
@@ -1321,6 +1334,7 @@ function requireDashboardAuth(req, res, next) {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
     return res.status(401).send("Invalid password");
   }
+  res.locals.dashboardAuthenticated = true;
   return next();
 }
 
@@ -1360,7 +1374,13 @@ app.use(requireDashboardAuth, async (req, res) => {
     }
   }
 
-  attachGatewayAuthHeader(req);
+  if (res.locals.dashboardAuthenticated) {
+    // Basic authenticates to this wrapper. The gateway's protected HTTP reads
+    // require its own Bearer token; never forward the setup password upstream.
+    req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+  } else {
+    attachGatewayAuthHeader(req);
+  }
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 

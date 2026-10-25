@@ -47,3 +47,9 @@ assert.ok(codexVersion.includes(codexPackage.version));
 
 console.log(`OpenClaw CLI and wrapper entry: ${version}`);
 console.log(`Control UI, WhatsApp and Codex manifests present; native Codex starts: ${codexVersion}`);
+const bridgeEntry = "/opt/openclaw-bridge/node_modules/openclaw/openclaw.mjs";
+const bridgePackage = JSON.parse(fs.readFileSync(path.join(path.dirname(bridgeEntry), "package.json"), "utf8"));
+assert.equal(bridgePackage.version, "2026.9.5");
+const bridgeVersion = run("node", [bridgeEntry, "--version"]);
+assert.ok(bridgeVersion.includes(bridgePackage.version));
+console.log(`Isolated legacy migration bridge starts: ${bridgeVersion}`);

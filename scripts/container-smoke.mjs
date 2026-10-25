@@ -10,7 +10,8 @@ const volume = `${name}-data`;
 const password = randomUUID();
 const token = randomUUID();
 const auth = `Basic ${Buffer.from(`smoke:${password}`).toString("base64")}`;
-const env = ["-e", "PORT=3210", "-e", `SETUP_PASSWORD=${password}`, "-e", `OPENCLAW_GATEWAY_TOKEN=${token}`];
+const env = ["-e", "PORT=3210", "-e", `SETUP_PASSWORD=${password}`, "-e", `OPENCLAW_GATEWAY_TOKEN=${token}`,
+  "-e", "OPENCLAW_MIGRATION=2026.10.7-from-prejuly"];
 let started = false;
 
 function docker(args, { allowFailure = false, timeout = 180_000 } = {}) {
@@ -25,7 +26,7 @@ function inContainer(script) {
   return docker(["exec", name, "node", "--input-type=module", "-e", script]);
 }
 async function ready(base) {
-  const deadline = Date.now() + 180_000;
+  const deadline = Date.now() + 300_000;
   let last = "no response";
   while (Date.now() < deadline) {
     try {
@@ -43,12 +44,28 @@ async function check(base) {
   await ready(base);
   assert.equal((await fetch(`${base}/setup`)).status, 401);
   assert.equal((await fetch(`${base}/openclaw`)).status, 401);
+  assert.equal((await fetch(`${base}/control-ui-config.json`)).status, 401);
   const setup = await fetch(`${base}/setup`, { headers: { authorization: auth } });
   assert.equal(setup.status, 200);
   assert.ok((await setup.text()).includes("OpenClaw"));
   const ui = await fetch(`${base}/openclaw/`, { headers: { authorization: auth } });
   assert.equal(ui.status, 200);
-  assert.ok((await ui.text()).toLowerCase().includes("<html"));
+  const html = await ui.text();
+  assert.ok(html.toLowerCase().includes("<html"));
+  const bootstrap = await fetch(`${base}/control-ui-config.json`, { headers: { authorization: auth } });
+  assert.equal(bootstrap.status, 200, "Authenticated browser must be able to bootstrap the Control UI");
+  assert.match(bootstrap.headers.get("content-type") || "", /application\/json/);
+  const bootstrapConfig = await bootstrap.json();
+  assert.equal(typeof bootstrapConfig.serverVersion, "string");
+  assert.ok(bootstrapConfig.serverVersion.length > 0);
+  assert.equal(typeof bootstrapConfig.basePath, "string");
+  const scriptSrc = html.match(/<script\b[^>]*\bsrc="([^"]+\.js)"/i)?.[1];
+  assert.ok(scriptSrc, "Control UI HTML must reference its compiled JavaScript");
+  const assetUrl = new URL(scriptSrc, ui.url);
+  assert.equal(assetUrl.origin, new URL(base).origin, "UI script must be served by the same protected wrapper");
+  const asset = await fetch(assetUrl, { headers: { authorization: auth } });
+  assert.equal(asset.status, 200);
+  assert.match(asset.headers.get("content-type") || "", /javascript/);
   const health = await (await fetch(`${base}/healthz`)).json();
   assert.equal(health.wrapper.configured, true);
   assert.equal(health.gateway.ready, true);
@@ -67,6 +84,31 @@ async function check(base) {
   `);
   // This uses OpenClaw's authenticated WebSocket RPC, not only the HTTP probe.
   docker(["exec", name, "openclaw", "health", "--json"], { timeout: 120_000 });
+  docker(["exec", name, "openclaw", "config", "validate", "--json"]);
+  inContainer(`
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { createHash } from "node:crypto";
+    import { DatabaseSync } from "node:sqlite";
+    const root = "/data/backups/openclaw-2026.10.7-from-prejuly";
+    const journal = JSON.parse(fs.readFileSync(root + "/journal.json", "utf8"));
+    assert.equal(journal.id, "2026.10.7-from-prejuly");
+    assert.equal(journal.stage, "complete");
+    assert.equal(fs.statSync(root).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(journal.archive).mode & 0o777, 0o600);
+    assert.equal(createHash("sha256").update(fs.readFileSync(journal.archive)).digest("hex"), journal.archiveSha256);
+    assert.equal(fs.readFileSync("/data/workspace/MEMORY.md", "utf8"), "Legacy smoke memory survives migration.");
+    const db = new DatabaseSync("/data/.openclaw/agents/main/agent/openclaw-agent.sqlite", { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT value FROM memory_index_meta WHERE key = ?").get("railway_smoke_legacy_import")?.value,
+        "fixture-preserved", "Legacy SQLite memory metadata must be imported into the canonical agent store");
+    } finally { db.close(); }
+    const config = JSON.parse(fs.readFileSync("/data/.openclaw/openclaw.json", "utf8"));
+    assert.equal(config.channels.whatsapp.enabled, false);
+    assert.equal(config.channels.whatsapp.dmPolicy, "allowlist");
+    assert.deepEqual(config.channels.whatsapp.allowFrom, ["+15555550123"]);
+    assert.equal(config.channels.whatsapp.groupPolicy, "disabled");
+  `);
 }
 
 try {
@@ -77,18 +119,35 @@ try {
 
   const seed = `
     const fs = require("node:fs");
+    const { DatabaseSync } = require("node:sqlite");
     fs.mkdirSync("/data/.openclaw", { recursive: true });
     fs.mkdirSync("/data/workspace", { recursive: true });
     fs.writeFileSync("/data/.openclaw/openclaw.json", JSON.stringify({
-      gateway: { mode: "local", auth: { mode: "token", token: process.env.OPENCLAW_GATEWAY_TOKEN },
+      meta: { lastTouchedVersion: "2026.3.8" },
+      gateway: { mode: "local", trustedProxies: ["127.0.0.1"],
+        auth: { mode: "token", token: process.env.OPENCLAW_GATEWAY_TOKEN },
         controlUi: { allowedOrigins: ["http://localhost:3210"] } },
-      agents: { defaults: { workspace: "/data/workspace" } }
+      agents: { defaults: { workspace: "/data/workspace", model: { primary: "openai-codex/gpt-5.5" } } },
+      channels: { whatsapp: { enabled: false, dmPolicy: "allowlist", allowFrom: ["+15555550123"], groupPolicy: "disabled" } }
     }));
     fs.mkdirSync("/data/.openclaw/credentials/whatsapp/default", { recursive: true });
     fs.mkdirSync("/data/.openclaw/agents/main/agent", { recursive: true });
     fs.writeFileSync("/data/workspace/persistence-sentinel.txt", "disposable smoke data");
+    fs.writeFileSync("/data/workspace/MEMORY.md", "Legacy smoke memory survives migration.");
     fs.writeFileSync("/data/.openclaw/credentials/whatsapp/default/persistence-sentinel.txt", "no real credentials");
     fs.writeFileSync("/data/.openclaw/agents/main/agent/persistence-sentinel.txt", "no real auth profiles");
+    fs.mkdirSync("/data/.openclaw/memory", { recursive: true });
+    // Exact pre-July schema from v2026.3.8 src/memory/memory-schema.ts.
+    // A metadata sentinel proves import without embeddings or model requests.
+    const memoryDb = new DatabaseSync("/data/.openclaw/memory/main.sqlite");
+    memoryDb.exec(
+      "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);" +
+      "CREATE TABLE files (path TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'memory', hash TEXT NOT NULL, mtime INTEGER NOT NULL, size INTEGER NOT NULL);" +
+      "CREATE TABLE chunks (id TEXT PRIMARY KEY, path TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'memory', start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, hash TEXT NOT NULL, model TEXT NOT NULL, text TEXT NOT NULL, embedding TEXT NOT NULL, updated_at INTEGER NOT NULL);" +
+      "CREATE TABLE embedding_cache (provider TEXT NOT NULL, model TEXT NOT NULL, provider_key TEXT NOT NULL, hash TEXT NOT NULL, embedding TEXT NOT NULL, dims INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (provider,model,provider_key,hash));"
+    );
+    memoryDb.prepare("INSERT INTO meta (key,value) VALUES (?,?)").run("railway_smoke_legacy_import", "fixture-preserved");
+    memoryDb.close();
   `;
   docker(["run", "--rm", "--network", "none", ...env, "-v", `${volume}:/data`, "--entrypoint", "node", image, "-e", seed]);
   docker(["run", "-d", "--name", name, ...env, "-p", "127.0.0.1::3210", "-v", `${volume}:/data`, image]);
@@ -103,6 +162,8 @@ try {
       "/data/.openclaw/agents/main/agent/persistence-sentinel.txt",
       "/data/.openclaw/credentials/whatsapp/default/persistence-sentinel.txt",
       "/data/workspace/persistence-sentinel.txt",
+      "/data/workspace/MEMORY.md",
+      "/data/backups/openclaw-2026.10.7-from-prejuly/journal.json",
     ];
     const config = JSON.parse(fs.readFileSync("/data/.openclaw/openclaw.json", "utf8"));
     const identity = { workspace: config.agents.defaults.workspace, mode: config.gateway.mode,
@@ -113,7 +174,7 @@ try {
   docker(["restart", "--time", "30", name]);
   await check(base);
   assert.equal(inContainer(stateHashScript), before, "State changed across container restart");
-  console.log("Real gateway, authenticated RPC, protected HTTP/UI, injected port and volume restart smoke passed.");
+  console.log("Legacy migration/backup, real gateway/RPC, protected UI bootstrap, injected port and volume restart smoke passed.");
   console.log("No model request or WhatsApp message was sent; those require production account verification.");
 } catch (error) {
   // Only disposable test state is used; the generated token is still redacted.

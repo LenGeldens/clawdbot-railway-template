@@ -40,11 +40,17 @@ RUN corepack enable \
   && printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
 
+# The documented pre-July migration bridge is an isolated, locked installation.
+# It is invoked only by the explicit one-time migration flow, never as a gateway.
+COPY migration/package.json migration/package-lock.json /opt/openclaw-bridge/
+RUN npm ci --prefix /opt/openclaw-bridge --omit=dev \
+  && npm cache clean --force
+
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
-COPY scripts/smoke.js scripts/healthcheck.js ./scripts/
+COPY scripts/smoke.js scripts/healthcheck.js scripts/migrate-state.mjs ./scripts/
 
 ENV OPENCLAW_ENTRY=/openclaw/openclaw.mjs \
     OPENCLAW_STATE_DIR=/data/.openclaw \
