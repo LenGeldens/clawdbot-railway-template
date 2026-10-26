@@ -1,0 +1,15 @@
+# Only these application inputs may enter a build context. In particular, never
+# send .git, node_modules, local volumes, auth files, .env or backups to a builder.
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!migration/
+!migration/package.json
+!migration/package-lock.json
+!src/
+!src/**
+!scripts/
+!scripts/smoke.js
+!scripts/healthcheck.js
+!scripts/migrate-state.mjs

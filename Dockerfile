@@ -1,89 +1,74 @@
-# Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
-FROM node:24.22.1-bookworm AS openclaw-build
+# Build the exact upstream release. Its normal build already includes the
+# Control UI and external plugin runtimes such as WhatsApp.
+ARG NODE_IMAGE=node:24.22.1-bookworm@sha256:6449e19d8184d84062525b6a7524def03146c2cb04a7f08b076680d0e8e4240a
+ARG BUN_IMAGE=oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
+FROM ${BUN_IMAGE} AS bun
+FROM ${NODE_IMAGE} AS openclaw-build
 
-# Dependencies needed for openclaw build
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    git \
-    ca-certificates \
-    curl \
-    python3 \
-    make \
-    g++ \
+    git ca-certificates python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
-
-# Install Bun (openclaw build uses it)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 RUN corepack enable
 
 WORKDIR /openclaw
-
-# Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
-# Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
 ARG OPENCLAW_GIT_REF=v2026.10.7
-RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+ARG OPENCLAW_GIT_SHA=157d8c2bc3ea2fa183afdc11088e69690bf8e64e
+RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git . \
+  && test "$(git rev-parse HEAD)" = "${OPENCLAW_GIT_SHA}"
 
-# Patch: relax version requirements for packages that may reference unpublished versions.
-# Apply to all extension package.json files to handle workspace protocol (workspace:*).
-RUN set -eux; \
-  find ./extensions -name 'package.json' -type f | while read -r f; do \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
-  done
-
-RUN pnpm install --no-frozen-lockfile
-RUN pnpm build
+# The packageManager field selects the release's pnpm version and integrity.
+# Keep the upstream manifests and lockfile intact.
+RUN pnpm install --frozen-lockfile
 ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:install && pnpm ui:build
+# Do not run ui:build again in a later layer. build already publishes the UI;
+# a second atomic rename of that lower-layer directory fails with EXDEV.
+RUN pnpm build
 
-
-# Runtime image
-FROM node:24.22.1-bookworm
+FROM ${NODE_IMAGE}
 ENV NODE_ENV=production
-
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates \
-    tini \
-    python3 \
-    python3-venv \
+    ca-certificates tini python3 python3-venv \
   && rm -rf /var/lib/apt/lists/*
 
-# `openclaw update` expects pnpm. Provide it in the runtime image.
-RUN corepack enable && corepack prepare pnpm@12.15.0 --activate
-
-# Persist user-installed tools by default by targeting the Railway volume.
-# - npm global installs -> /data/npm
-# - pnpm global installs -> /data/pnpm (binaries) + /data/pnpm-store (store)
-ENV NPM_CONFIG_PREFIX=/data/npm
-ENV NPM_CONFIG_CACHE=/data/npm-cache
-ENV PNPM_HOME=/data/pnpm
-ENV PNPM_STORE_DIR=/data/pnpm-store
-ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
-
-WORKDIR /app
-
-# Wrapper deps
-COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
-
-# Copy built openclaw
 COPY --from=openclaw-build /openclaw /openclaw
-
-# Provide an openclaw executable
-RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
+# Keep runtime pnpm aligned with the same release, without a separate version pin.
+RUN corepack enable \
+  && corepack prepare "$(node -p "require('/openclaw/package.json').packageManager")" --activate \
+  && printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
 
+# The documented pre-July migration bridge is an isolated, locked installation.
+# It is invoked only by the explicit one-time migration flow, never as a gateway.
+# Include its exact Codex/WhatsApp packages as physical bundled plugins so Doctor
+# does not install an older plugin generation into the persistent state volume.
+# Finish the official lifecycle first; deferred cleanup would prune added files.
+COPY migration/package.json migration/package-lock.json /opt/openclaw-bridge/
+RUN npm ci --prefix /opt/openclaw-bridge --omit=dev \
+  && node /opt/openclaw-bridge/node_modules/openclaw/scripts/postinstall-bundled-plugins.mjs \
+  && node -e 'const fs=require("node:fs"); for (const id of ["codex","whatsapp"]) fs.cpSync("/opt/openclaw-bridge/node_modules/@openclaw/"+id,"/opt/openclaw-bridge/node_modules/openclaw/dist/extensions/"+id,{recursive:true,dereference:true});' \
+  && npm cache clean --force
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
+COPY scripts/smoke.js scripts/healthcheck.js scripts/migrate-state.mjs ./scripts/
 
-# The wrapper listens on $PORT.
-# IMPORTANT: Do not set a default PORT here.
-# Railway injects PORT at runtime and routes traffic to that port.
-# If we force a different port, deployments can come up but the domain will route elsewhere.
+ENV OPENCLAW_ENTRY=/openclaw/openclaw.mjs \
+    OPENCLAW_STATE_DIR=/data/.openclaw \
+    OPENCLAW_WORKSPACE_DIR=/data/workspace \
+    NPM_CONFIG_PREFIX=/data/npm \
+    NPM_CONFIG_CACHE=/data/npm-cache \
+    PNPM_HOME=/data/pnpm \
+    PNPM_STORE_DIR=/data/pnpm-store
+ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
+
+# Railway injects PORT. Do not override it with a Docker default.
 EXPOSE 8080
-
-# Ensure PID 1 reaps zombies and forwards signals.
-ENTRYPOINT ["tini", "--"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+  CMD ["node", "scripts/healthcheck.js"]
+ENTRYPOINT ["tini", "-s", "--"]
 CMD ["node", "src/server.js"]

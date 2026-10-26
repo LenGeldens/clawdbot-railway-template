@@ -19,9 +19,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
-      - name: Bump Dockerfile OPENCLAW_GIT_REF if needed
+      - name: Pin the official release tag and verified commit
         run: node scripts/bump-openclaw-ref.mjs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -30,12 +30,14 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: bump OPENCLAW_GIT_REF to latest release"
-          title: "chore: bump OPENCLAW_GIT_REF to latest OpenClaw release"
+          commit-message: "chore: bump pinned OpenClaw release source"
+          title: "chore: bump pinned OpenClaw release source"
           body: |
-            Automated update of the default OpenClaw build ref (`OPENCLAW_GIT_REF`) to the latest upstream release tag.
+            Automated update of the official OpenClaw release tag and immutable commit SHA.
 
-            This keeps the Railway template stable-by-default while staying current.
+            Run the Docker build workflow on this branch before merging. GitHub may suppress
+            workflows on PRs created with GITHUB_TOKEN; use workflow_dispatch when needed.
+            Review Node/Bun requirements, back up state and review migrations before deployment.
           branch: chore/bump-openclaw-ref
           delete-branch: true
           labels: |

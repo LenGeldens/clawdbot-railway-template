@@ -7,6 +7,7 @@ import path from "node:path";
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
+import { migrateState } from "../scripts/migrate-state.mjs";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -39,6 +40,18 @@ const STATE_DIR =
 const WORKSPACE_DIR =
   process.env.OPENCLAW_WORKSPACE_DIR?.trim() ||
   path.join(STATE_DIR, "workspace");
+
+// Explicit, one-time upgrade for pre-July state. This must run before token,
+// config, bootstrap or gateway writes. A failed migration stops startup.
+await migrateState({
+  env: process.env,
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  node: process.env.OPENCLAW_NODE?.trim() || "node",
+  entry: process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/openclaw.mjs",
+  gatewayPort: Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10),
+  log: console.log,
+});
 
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
@@ -75,8 +88,8 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT 
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
-// Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
-const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
+// Use OpenClaw's supported launcher so its runtime bootstrap is applied.
+const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/openclaw.mjs";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 function clawArgs(args) {
@@ -136,6 +149,8 @@ function isConfigured() {
 
 let gatewayProc = null;
 let gatewayStarting = null;
+let gatewayStopping = null;
+let shuttingDown = false;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -151,27 +166,15 @@ async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    try {
-      // Try the default Control UI base path, then fall back to root.
-      const paths = ["/openclaw", "/"];
-      for (const p of paths) {
-        try {
-          const res = await fetch(`${GATEWAY_TARGET}${p}`, { method: "GET" });
-          // Any HTTP response means the port is open.
-          if (res) return true;
-        } catch {
-          // try next
-        }
-      }
-    } catch {
-      // not ready
-    }
+    if (shuttingDown || gatewayStopping) return false;
+    if (await probeGateway(Math.min(1_500, timeoutMs - (Date.now() - start)))) return true;
     await sleep(250);
   }
   return false;
 }
 
 async function startGateway() {
+  if (shuttingDown || gatewayStopping) throw new Error("Gateway is stopping");
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
@@ -191,7 +194,7 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
-  gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
+  const proc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
@@ -199,19 +202,20 @@ async function startGateway() {
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
     },
   });
+  gatewayProc = proc;
 
-  gatewayProc.on("error", (err) => {
+  proc.on("error", (err) => {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
-    gatewayProc = null;
+    if (gatewayProc === proc) gatewayProc = null;
   });
 
-  gatewayProc.on("exit", (code, signal) => {
+  proc.on("exit", (code, signal) => {
     const msg = `[gateway] exited code=${code} signal=${signal}`;
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
-    gatewayProc = null;
+    if (gatewayProc === proc) gatewayProc = null;
   });
 }
 
@@ -231,8 +235,15 @@ async function runDoctorBestEffort() {
 }
 
 async function ensureGatewayRunning() {
+  if (shuttingDown) throw new Error("Wrapper is shutting down");
+  if (gatewayStopping) await gatewayStopping;
+  if (shuttingDown) throw new Error("Wrapper is shutting down");
   if (!isConfigured()) return { ok: false, reason: "not configured" };
-  if (gatewayProc) return { ok: true };
+  if (gatewayStarting) {
+    await gatewayStarting;
+    return { ok: true };
+  }
+  if (gatewayProc && await probeGateway()) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       try {
@@ -246,7 +257,7 @@ async function ensureGatewayRunning() {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
         // Collect extra diagnostics to help users file issues.
-        await runDoctorBestEffort();
+        if (!shuttingDown && !gatewayStopping) await runDoctorBestEffort();
         throw err;
       }
     })().finally(() => {
@@ -257,17 +268,49 @@ async function ensureGatewayRunning() {
   return { ok: true };
 }
 
-async function restartGateway() {
-  if (gatewayProc) {
+function waitForGatewayExit(proc, timeoutMs) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const finish = (error) => {
+      clearTimeout(timer);
+      proc.off("exit", onExit);
+      proc.off("error", onError);
+      error ? reject(error) : resolve();
+    };
+    const onExit = () => finish();
+    const onError = (error) => finish(error);
+    const timer = setTimeout(() => finish(new Error("Gateway did not exit in time")), timeoutMs);
+    proc.once("exit", onExit);
+    proc.once("error", onError);
+  });
+}
+
+async function stopGateway() {
+  if (gatewayStopping) return gatewayStopping;
+  const proc = gatewayProc;
+  if (!proc) return;
+  gatewayStopping = (async () => {
+    const exited = waitForGatewayExit(proc, 20_000);
+    try { proc.kill("SIGTERM"); } catch {}
     try {
-      gatewayProc.kill("SIGTERM");
-    } catch {
-      // ignore
+      await exited;
+    } catch (error) {
+      if (proc.exitCode !== null || proc.signalCode !== null) throw error;
+      console.error("[gateway] graceful shutdown timed out; terminating process");
+      const killed = waitForGatewayExit(proc, 3_000);
+      try { proc.kill("SIGKILL"); } catch {}
+      await killed;
+      throw new Error("Gateway required forced termination; graceful shutdown failed", { cause: error });
     }
-    // Give it a moment to exit and release the port.
-    await sleep(750);
-    gatewayProc = null;
-  }
+    // An in-flight start must settle before another owner can be created.
+    if (gatewayStarting) await gatewayStarting.catch(() => {});
+  })().finally(() => { gatewayStopping = null; });
+  return gatewayStopping;
+}
+
+async function restartGateway() {
+  if (shuttingDown) throw new Error("Wrapper is shutting down");
+  await stopGateway();
   return ensureGatewayRunning();
 }
 
@@ -297,62 +340,48 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  if (shuttingDown) return res.status(503).set("Connection", "close").send("Wrapper is shutting down");
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 
-// Minimal health endpoint for Railway.
-app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
-
-async function probeGateway() {
-  // Don't assume HTTP — the gateway primarily speaks WebSocket.
-  // A simple TCP connect check is enough for "is it up".
-  const net = await import("node:net");
-
-  return await new Promise((resolve) => {
-    const sock = net.createConnection({
-      host: INTERNAL_GATEWAY_HOST,
-      port: INTERNAL_GATEWAY_PORT,
-      timeout: 750,
+async function probeGateway(timeoutMs = 1_500) {
+  try {
+    // OpenClaw /readyz checks startup and subsystem readiness. An open TCP port,
+    // a login page, or even a successful Control UI response does not prove this.
+    const response = await fetch(`${GATEWAY_TARGET}/readyz`, {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      return false;
+    }
+    const body = await response.json();
+    return body?.ready === true;
+  } catch {
+    return false;
+  }
+}
 
-    const done = (ok) => {
-      try { sock.destroy(); } catch {}
-      resolve(ok);
-    };
-
-    sock.on("connect", () => done(true));
-    sock.on("timeout", () => done(false));
-    sock.on("error", () => done(false));
+// A fresh installation must remain reachable for onboarding. Once configured,
+// Railway should only promote a deployment when the gateway is actually ready.
+// Both public endpoints expose booleans only; diagnostics stay behind setup auth.
+async function healthCheck(_req, res) {
+  const configured = isConfigured();
+  const ready = configured && await probeGateway();
+  const ok = !configured || ready;
+  res.set("Cache-Control", "no-store").status(ok ? 200 : 503).json({
+    ok,
+    wrapper: { configured },
+    gateway: { ready },
   });
 }
 
-// Public health endpoint (no auth) so Railway can probe without /setup.
-// Keep this free of secrets.
-app.get("/healthz", async (_req, res) => {
-  let gatewayReachable = false;
-  if (isConfigured()) {
-    try {
-      gatewayReachable = await probeGateway();
-    } catch {
-      gatewayReachable = false;
-    }
-  }
-
-  res.json({
-    ok: true,
-    wrapper: {
-      configured: isConfigured(),
-      stateDir: STATE_DIR,
-      workspaceDir: WORKSPACE_DIR,
-    },
-    gateway: {
-      target: GATEWAY_TARGET,
-      reachable: gatewayReachable,
-      lastError: lastGatewayError,
-      lastExit: lastGatewayExit,
-      lastDoctorAt,
-    },
-  });
-});
+app.get("/setup/healthz", healthCheck);
+app.get("/healthz", healthCheck);
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
   // Serve JS for /setup (kept external to avoid inline encoding/template issues)
@@ -1004,11 +1033,7 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       return res.json({ ok: true, output: "Gateway restarted (wrapper-managed).\n" });
     }
     if (cmd === "gateway.stop") {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
+      await stopGateway();
       return res.json({ ok: true, output: "Gateway stopped (wrapper-managed).\n" });
     }
     if (cmd === "gateway.start") {
@@ -1149,15 +1174,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   // Keep credentials/sessions/workspace by default.
   try {
     // Stop gateway to avoid running gateway + onboard concurrently on small Railway instances.
-    try {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
-    } catch {
-      // ignore
-    }
+    await stopGateway();
 
     const candidates = typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : [configPath()];
     for (const p of candidates) {
@@ -1268,11 +1285,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     }
 
     // Stop gateway before restore so we don't overwrite live files.
-    if (gatewayProc) {
-      try { gatewayProc.kill("SIGTERM"); } catch {}
-      await sleep(750);
-      gatewayProc = null;
-    }
+    await stopGateway();
 
     const buf = await readBodyBuffer(req, 250 * 1024 * 1024); // 250MB max
     if (!buf.length) return res.status(400).type("text/plain").send("Empty body\n");
@@ -1348,6 +1361,7 @@ function requireDashboardAuth(req, res, next) {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
     return res.status(401).send("Invalid password");
   }
+  res.locals.dashboardAuthenticated = true;
   return next();
 }
 
@@ -1387,7 +1401,13 @@ app.use(requireDashboardAuth, async (req, res) => {
     }
   }
 
-  attachGatewayAuthHeader(req);
+  if (res.locals.dashboardAuthenticated) {
+    // Basic authenticates to this wrapper. The gateway's protected HTTP reads
+    // require its own Bearer token; never forward the setup password upstream.
+    req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+  } else {
+    attachGatewayAuthHeader(req);
+  }
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1464,7 +1484,7 @@ server.on("upgrade", async (req, socket, head) => {
   // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
   // The gateway authenticates at the protocol layer and we inject the gateway token below.
 
-  if (!isConfigured()) {
+  if (shuttingDown || !isConfigured()) {
     socket.destroy();
     return;
   }
@@ -1478,20 +1498,34 @@ server.on("upgrade", async (req, socket, head) => {
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
-process.on("SIGTERM", () => {
-  // Best-effort shutdown
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // The wrapper owns container lifetime. HTTP closing is not evidence that the
+  // gateway finished flushing SQLite and releasing its persistent state leases.
+  const deadline = setTimeout(() => {
+    console.error("[wrapper] shutdown deadline exceeded");
+    try { gatewayProc?.kill("SIGKILL"); } catch {}
+    server.closeAllConnections();
+    process.exit(1);
+  }, 25_000);
+  const httpClosed = new Promise((resolve) => server.close(resolve));
+  server.closeIdleConnections();
   try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
-
-  // Stop accepting new connections; allow in-flight requests to complete briefly.
-  try {
-    server.close(() => process.exit(0));
-  } catch {
+    await stopGateway();
+    server.closeAllConnections();
+    await httpClosed;
+    clearTimeout(deadline);
     process.exit(0);
+  } catch (error) {
+    console.error(`[wrapper] shutdown failed: ${String(error)}`);
+    if (!gatewayProc) {
+      clearTimeout(deadline);
+      process.exit(1);
+    }
+    // Retain the deadline if a child has not actually exited.
   }
+}
 
-  setTimeout(() => process.exit(0), 5_000).unref?.();
-});
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
