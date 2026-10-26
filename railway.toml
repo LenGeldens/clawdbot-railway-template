@@ -5,6 +5,9 @@ builder = "dockerfile"
 healthcheckPath = "/setup/healthz"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"
+# Let the gateway close its databases before Railway terminates the container.
+drainingSeconds = "30"
+overlapSeconds = "0"
 
 # Require a persistent volume mounted at /data (Railway).
 requiredMountPath = "/data"

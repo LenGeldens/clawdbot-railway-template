@@ -11,14 +11,15 @@ const password = randomUUID();
 const token = randomUUID();
 const auth = `Basic ${Buffer.from(`smoke:${password}`).toString("base64")}`;
 const env = ["-e", "PORT=3210", "-e", `SETUP_PASSWORD=${password}`, "-e", `OPENCLAW_GATEWAY_TOKEN=${token}`,
-  "-e", "OPENCLAW_MIGRATION=2026.10.7-from-prejuly"];
+  "-e", "OPENCLAW_MIGRATION=2026.10.7-from-prejuly", "-e", "OPENCLAW_DEBUG=1"];
 let started = false;
+const redact = value => String(value).split(token).join("[redacted]").split(password).join("[redacted]").split(auth).join("[redacted]");
 
 function docker(args, { allowFailure = false, timeout = 180_000 } = {}) {
   const result = spawnSync("docker", args, { encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024 });
   if (!allowFailure) {
-    assert.equal(result.error, undefined, result.error?.message);
-    assert.equal(result.status, 0, result.stderr || result.stdout || "Docker command failed");
+    assert.equal(result.error, undefined, redact(result.error?.message || ""));
+    assert.equal(result.status, 0, redact(result.stderr || result.stdout || "Docker command failed"));
   }
   return (args[0] === "logs" ? `${result.stdout || ""}\n${result.stderr || ""}` : result.stdout)?.trim() || "";
 }
@@ -27,6 +28,7 @@ function inContainer(script) {
 }
 async function ready(base) {
   const deadline = Date.now() + 300_000;
+  let nextDebugCheck = Date.now() + 30_000;
   let last = "no response";
   while (Date.now() < deadline) {
     try {
@@ -36,6 +38,21 @@ async function ready(base) {
       if (res.ok && data.ok === true) return;
     } catch (error) { last = error.message; }
     assert.equal(docker(["inspect", "--format", "{{.State.Running}}", name]), "true", "Wrapper exited");
+    // The authenticated debug route also runs CLI diagnostics, so call it only
+    // after startup has had time to finish, not on every readiness poll.
+    if (Date.now() >= nextDebugCheck) {
+      let lastExit;
+      try {
+        const debug = await fetch(`${base}/setup/api/debug`, {
+          headers: { authorization: auth }, signal: AbortSignal.timeout(30_000),
+        });
+        if (debug.ok) lastExit = (await debug.json()).wrapper?.lastGatewayExit;
+      } catch { /* Keep the original readiness failure if diagnostics time out. */ }
+      if (Number.isInteger(lastExit?.code) && lastExit.code !== 0) {
+        throw new Error(`Gateway process exited with code ${lastExit.code}; see the disposable container logs`);
+      }
+      nextDebugCheck = Date.now() + 30_000;
+    }
     await delay(1_000);
   }
   throw new Error(`Wrapper/gateway readiness timed out: ${last}`);
@@ -170,6 +187,7 @@ try {
   const address = docker(["port", name, "3210/tcp"]).split("\n")[0];
   const base = `http://${address}`;
   await check(base);
+  console.log("First gateway, protected UI, RPC, migrated state and canonical plugin inventory checks passed.");
   const stateHashScript = `
     import fs from "node:fs";
     import { createHash } from "node:crypto";
@@ -186,10 +204,12 @@ try {
     console.log(createHash("sha256").update(JSON.stringify(identity)).update(Buffer.concat(paths.map(p => fs.readFileSync(p)))).digest("hex"));
   `;
   const before = inContainer(stateHashScript);
+  console.log("Restarting the same container and persistent test volume.");
   docker(["restart", "--time", "30", name]);
   // Docker can allocate a new host port when restarting a container whose
   // published host port was left ephemeral.
   const restartedAddress = docker(["port", name, "3210/tcp"]).split("\n")[0];
+  console.log("Checking gateway readiness after container restart.");
   await check(`http://${restartedAddress}`);
   assert.equal(inContainer(stateHashScript), before, "State changed across container restart");
   console.log("Legacy migration/backup, real gateway/RPC, protected UI bootstrap, injected port and volume restart smoke passed.");
@@ -198,7 +218,7 @@ try {
   // Only disposable test state is used; the generated token is still redacted.
   if (started) {
     const logs = docker(["logs", "--tail", "120", name], { allowFailure: true });
-    console.error(logs.split(token).join("[redacted]").split(password).join("[redacted]"));
+    console.error(redact(logs));
   }
   const stage = docker(["run", "--rm", "--network", "none", "-v", `${volume}:/data`, "--entrypoint", "node", image,
     "-e", 'const fs=require("node:fs"); const file="/data/backups/openclaw-2026.10.7-from-prejuly/journal.json"; console.log("Migration stage:",fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")).stage:"not started");'], { allowFailure: true });

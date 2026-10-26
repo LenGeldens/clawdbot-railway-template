@@ -13,6 +13,13 @@ Een opdracht op de laptop verandert de productiecontainer niet.
   `/data/workspace`. Controleer ook de werkelijk opgeslagen workspace-instelling.
 - Laat de wrapper luisteren op Railway's `PORT`; controleer dat de publieke
   target port daarbij past. De interne gateway blijft op loopback, poort 18789.
+- Stel Railway **Draining seconds** in op `30`, ook in het dashboard wanneer
+  de service `railway.toml` niet toepast. De wrapper wacht bij SIGTERM/SIGINT
+  maximaal 25 seconden op afsluiting van de gateway, zodat databases kunnen
+  sluiten voordat de container eindigt. Railway geeft standaard geen
+  afsluittermijn; zie de [officiële teardown-documentatie](https://docs.railway.com/deployments/reference#singleton-deploys).
+  Houd **Overlap seconds** op `0`; gebruik geen overlappende gateways met
+  dezelfde WhatsApp-koppeling.
 - Houd setup-authenticatie, gateway-authenticatie, WhatsApp-allowlist en
   groepsbeperkingen intact. Start nooit twee gateways met dezelfde
   WhatsApp-credentials.

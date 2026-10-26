@@ -149,6 +149,8 @@ function isConfigured() {
 
 let gatewayProc = null;
 let gatewayStarting = null;
+let gatewayStopping = null;
+let shuttingDown = false;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -164,6 +166,7 @@ async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    if (shuttingDown || gatewayStopping) return false;
     if (await probeGateway(Math.min(1_500, timeoutMs - (Date.now() - start)))) return true;
     await sleep(250);
   }
@@ -171,6 +174,7 @@ async function waitForGatewayReady(opts = {}) {
 }
 
 async function startGateway() {
+  if (shuttingDown || gatewayStopping) throw new Error("Gateway is stopping");
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
@@ -231,6 +235,9 @@ async function runDoctorBestEffort() {
 }
 
 async function ensureGatewayRunning() {
+  if (shuttingDown) throw new Error("Wrapper is shutting down");
+  if (gatewayStopping) await gatewayStopping;
+  if (shuttingDown) throw new Error("Wrapper is shutting down");
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayStarting) {
     await gatewayStarting;
@@ -250,7 +257,7 @@ async function ensureGatewayRunning() {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
         // Collect extra diagnostics to help users file issues.
-        await runDoctorBestEffort();
+        if (!shuttingDown && !gatewayStopping) await runDoctorBestEffort();
         throw err;
       }
     })().finally(() => {
@@ -261,17 +268,49 @@ async function ensureGatewayRunning() {
   return { ok: true };
 }
 
-async function restartGateway() {
-  if (gatewayProc) {
+function waitForGatewayExit(proc, timeoutMs) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const finish = (error) => {
+      clearTimeout(timer);
+      proc.off("exit", onExit);
+      proc.off("error", onError);
+      error ? reject(error) : resolve();
+    };
+    const onExit = () => finish();
+    const onError = (error) => finish(error);
+    const timer = setTimeout(() => finish(new Error("Gateway did not exit in time")), timeoutMs);
+    proc.once("exit", onExit);
+    proc.once("error", onError);
+  });
+}
+
+async function stopGateway() {
+  if (gatewayStopping) return gatewayStopping;
+  const proc = gatewayProc;
+  if (!proc) return;
+  gatewayStopping = (async () => {
+    const exited = waitForGatewayExit(proc, 20_000);
+    try { proc.kill("SIGTERM"); } catch {}
     try {
-      gatewayProc.kill("SIGTERM");
-    } catch {
-      // ignore
+      await exited;
+    } catch (error) {
+      if (proc.exitCode !== null || proc.signalCode !== null) throw error;
+      console.error("[gateway] graceful shutdown timed out; terminating process");
+      const killed = waitForGatewayExit(proc, 3_000);
+      try { proc.kill("SIGKILL"); } catch {}
+      await killed;
+      throw new Error("Gateway required forced termination; graceful shutdown failed", { cause: error });
     }
-    // Give it a moment to exit and release the port.
-    await sleep(750);
-    gatewayProc = null;
-  }
+    // An in-flight start must settle before another owner can be created.
+    if (gatewayStarting) await gatewayStarting.catch(() => {});
+  })().finally(() => { gatewayStopping = null; });
+  return gatewayStopping;
+}
+
+async function restartGateway() {
+  if (shuttingDown) throw new Error("Wrapper is shutting down");
+  await stopGateway();
   return ensureGatewayRunning();
 }
 
@@ -301,6 +340,10 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  if (shuttingDown) return res.status(503).set("Connection", "close").send("Wrapper is shutting down");
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 
 async function probeGateway(timeoutMs = 1_500) {
@@ -990,11 +1033,7 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       return res.json({ ok: true, output: "Gateway restarted (wrapper-managed).\n" });
     }
     if (cmd === "gateway.stop") {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
+      await stopGateway();
       return res.json({ ok: true, output: "Gateway stopped (wrapper-managed).\n" });
     }
     if (cmd === "gateway.start") {
@@ -1135,15 +1174,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   // Keep credentials/sessions/workspace by default.
   try {
     // Stop gateway to avoid running gateway + onboard concurrently on small Railway instances.
-    try {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
-    } catch {
-      // ignore
-    }
+    await stopGateway();
 
     const candidates = typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : [configPath()];
     for (const p of candidates) {
@@ -1254,11 +1285,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     }
 
     // Stop gateway before restore so we don't overwrite live files.
-    if (gatewayProc) {
-      try { gatewayProc.kill("SIGTERM"); } catch {}
-      await sleep(750);
-      gatewayProc = null;
-    }
+    await stopGateway();
 
     const buf = await readBodyBuffer(req, 250 * 1024 * 1024); // 250MB max
     if (!buf.length) return res.status(400).type("text/plain").send("Empty body\n");
@@ -1457,7 +1484,7 @@ server.on("upgrade", async (req, socket, head) => {
   // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
   // The gateway authenticates at the protocol layer and we inject the gateway token below.
 
-  if (!isConfigured()) {
+  if (shuttingDown || !isConfigured()) {
     socket.destroy();
     return;
   }
@@ -1471,20 +1498,34 @@ server.on("upgrade", async (req, socket, head) => {
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
-process.on("SIGTERM", () => {
-  // Best-effort shutdown
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // The wrapper owns container lifetime. HTTP closing is not evidence that the
+  // gateway finished flushing SQLite and releasing its persistent state leases.
+  const deadline = setTimeout(() => {
+    console.error("[wrapper] shutdown deadline exceeded");
+    try { gatewayProc?.kill("SIGKILL"); } catch {}
+    server.closeAllConnections();
+    process.exit(1);
+  }, 25_000);
+  const httpClosed = new Promise((resolve) => server.close(resolve));
+  server.closeIdleConnections();
   try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
-
-  // Stop accepting new connections; allow in-flight requests to complete briefly.
-  try {
-    server.close(() => process.exit(0));
-  } catch {
+    await stopGateway();
+    server.closeAllConnections();
+    await httpClosed;
+    clearTimeout(deadline);
     process.exit(0);
+  } catch (error) {
+    console.error(`[wrapper] shutdown failed: ${String(error)}`);
+    if (!gatewayProc) {
+      clearTimeout(deadline);
+      process.exit(1);
+    }
+    // Retain the deadline if a child has not actually exited.
   }
+}
 
-  setTimeout(() => process.exit(0), 5_000).unref?.();
-});
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

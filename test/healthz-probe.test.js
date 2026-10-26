@@ -32,6 +32,7 @@ if (args[0] === "config" && args[1] === "set") {
   fs.writeFileSync(configPath, JSON.stringify(config));
 } else if (args[0] === "gateway") {
   fs.writeFileSync(path.join(state, "fixture.pid"), String(process.pid));
+  fs.appendFileSync(path.join(state, "fixture-starts"), process.pid + "\\n");
   const server = http.createServer((req, res) => {
     const mode = fs.readFileSync(path.join(state, "fixture-mode"), "utf8");
     if (req.url === "/control-ui-config.json") {
@@ -59,10 +60,21 @@ if (args[0] === "config" && args[1] === "set") {
     }));
   });
   server.listen(Number(process.env.INTERNAL_GATEWAY_PORT), "127.0.0.1");
+  let stopping = false;
   process.on("SIGTERM", () => {
+    if (stopping) return;
+    stopping = true;
+    fs.writeFileSync(path.join(state, "fixture-stopping"), "stopping");
     server.closeAllConnections();
-    server.close(() => process.exit(0));
+    server.close();
+    const wait = fs.existsSync(path.join(state, "fixture-flush-delay"))
+      ? Number(fs.readFileSync(path.join(state, "fixture-flush-delay"), "utf8")) : 0;
+    setTimeout(() => {
+      fs.writeFileSync(path.join(state, "fixture-flushed"), "committed before exit");
+      process.exit(0);
+    }, wait);
   });
+  process.on("message", message => { if (message === "test-sigterm") process.emit("SIGTERM"); });
 } else {
   console.log("fixture CLI");
 }
@@ -114,14 +126,31 @@ async function makeState(t, configured) {
   return state;
 }
 
-async function startWrapper(t, state) {
+async function startWrapper(t, state, { signalControl = false } = {}) {
   const port = await freePort();
   const gatewayPort = await freePort();
   const fallbackPort = await freePort();
   // Do not inherit provider keys, OpenClaw state overrides or real credentials.
   const env = Object.fromEntries(["PATH", "SystemRoot", "TEMP", "TMP", "HOME"]
     .filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
-  const proc = spawn(process.execPath, ["src/server.js"], {
+  // Windows process.kill bypasses JS signal handlers. The test launcher maps
+  // signals to IPC there, retaining real child exit events and delayed writes.
+  const launcher = path.join(state, "wrapper-launcher.mjs");
+  if (signalControl) await fs.writeFile(launcher, `
+    import childProcess from "node:child_process";
+    const originalSpawn = childProcess.spawn;
+    if (process.platform === "win32") childProcess.spawn = function(command, args, options) {
+      if (args?.[1] !== "gateway") return originalSpawn(command, args, options);
+      const child = originalSpawn(command, args, { ...options, stdio: ["ignore", "inherit", "inherit", "ipc"] });
+      const kill = child.kill.bind(child);
+      child.kill = signal => signal === "SIGTERM" && child.connected
+        ? (child.send("test-sigterm"), true) : kill(signal);
+      return child;
+    };
+    process.on("message", signal => process.emit(signal));
+    await import(${JSON.stringify(new URL("../src/server.js", import.meta.url).href)});
+  `);
+  const proc = spawn(process.execPath, [signalControl ? launcher : "src/server.js"], {
     cwd: root,
     env: {
       ...env,
@@ -135,7 +164,7 @@ async function startWrapper(t, state) {
       INTERNAL_GATEWAY_HOST: "127.0.0.1",
       SETUP_PASSWORD: setupPassword,
     },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: signalControl ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
   });
   let output = "";
   proc.stdout.on("data", (chunk) => { output += chunk; });
@@ -166,7 +195,10 @@ async function startWrapper(t, state) {
     if (proc.exitCode !== null) throw new Error(output);
     return await request("/setup/healthz");
   }, `Wrapper did not listen on PORT (${port}): ${output}`);
-  return { request, stop, state, output: () => output };
+  return { request, stop, state, proc, signal: signal => {
+    if (process.platform === "win32") proc.send(signal);
+    else proc.kill(signal);
+  }, output: () => output };
 }
 
 async function assertHealth(wrapper, { configured, ready, status }) {
@@ -263,4 +295,53 @@ test("configured wrapper waits for actual readiness and preserves state across r
   assert.equal(config.gateway.remote.token, token);
   assert.equal(await fs.readFile(path.join(state, "workspace", "notes.md"), "utf8"), "preserve workspace");
   assert.equal((await wrapper.request("/setup")).status, 401);
+});
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  test(`wrapper ${signal} waits for gateway flush and prevents restart during shutdown`, async (t) => {
+    const state = await makeState(t, true);
+    await fs.writeFile(path.join(state, "fixture-mode"), "ready");
+    await fs.writeFile(path.join(state, "fixture-flush-delay"), "500");
+    const wrapper = await startWrapper(t, state, { signalControl: true });
+    await eventually(() => wrapper.output().includes("[wrapper] gateway ready"), "Gateway not ready");
+    let restart;
+    if (signal === "SIGINT") {
+      restart = wrapper.request("/setup/api/console/run", {
+        method: "POST", headers: { authorization, "Content-Type": "application/json" },
+        body: JSON.stringify({ cmd: "gateway.restart" }),
+      }).catch(() => null);
+      await eventually(() => fs.stat(path.join(state, "fixture-stopping")), "Restart did not stop child");
+    }
+    const exited = once(wrapper.proc, "exit");
+    wrapper.signal(signal);
+    await eventually(() => fs.stat(path.join(state, "fixture-stopping")), "Shutdown did not stop child");
+    await delay(100);
+    assert.equal(wrapper.proc.exitCode, null, "Wrapper exited before the child completed its flush");
+    assert.equal(wrapper.proc.signalCode, null);
+    const duringShutdown = await wrapper.request("/setup/api/console/run", {
+      method: "POST", headers: { authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: "gateway.start" }),
+    }).catch(() => null);
+    if (duringShutdown) assert.equal(duringShutdown.status, 503);
+    assert.deepEqual(await exited, [0, null]);
+    if (restart) await restart;
+    assert.equal(await fs.readFile(path.join(state, "fixture-flushed"), "utf8"), "committed before exit");
+    assert.equal((await fs.readFile(path.join(state, "fixture-starts"), "utf8")).trim().split("\n").length, 1,
+      "Shutdown allowed a replacement gateway to start");
+  });
+}
+
+test("reset waits for gateway exit before removing config and retains workspace", async (t) => {
+  const state = await makeState(t, true);
+  await fs.writeFile(path.join(state, "fixture-mode"), "ready");
+  await fs.writeFile(path.join(state, "fixture-flush-delay"), "500");
+  const wrapper = await startWrapper(t, state, { signalControl: true });
+  await eventually(() => wrapper.output().includes("[wrapper] gateway ready"), "Gateway not ready");
+  const reset = wrapper.request("/setup/api/reset", { method: "POST", headers: { authorization } });
+  await eventually(() => fs.stat(path.join(state, "fixture-stopping")), "Reset did not stop child");
+  await fs.access(path.join(state, "openclaw.json"));
+  assert.equal((await reset).status, 200);
+  assert.equal(await fs.readFile(path.join(state, "fixture-flushed"), "utf8"), "committed before exit");
+  await assert.rejects(fs.access(path.join(state, "openclaw.json")), { code: "ENOENT" });
+  assert.equal(await fs.readFile(path.join(state, "workspace", "notes.md"), "utf8"), "preserve workspace");
 });
