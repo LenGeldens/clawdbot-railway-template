@@ -198,6 +198,10 @@ The container smoke does not log into a provider or WhatsApp, send a message, or
 prove account/model access. Those checks are separate from a successful image
 build and must use the actual account after deployment.
 
+The opt-in legacy migration bridge includes locked OpenClaw, Codex and WhatsApp
+2026.9.5 packages inside the image. CI runs migration with networking disabled and
+an enabled, unpaired WhatsApp fixture before checking gateway startup and restart.
+
 ---
 
 ## Official template / endorsements

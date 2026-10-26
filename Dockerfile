@@ -42,8 +42,13 @@ RUN corepack enable \
 
 # The documented pre-July migration bridge is an isolated, locked installation.
 # It is invoked only by the explicit one-time migration flow, never as a gateway.
+# Include its exact Codex/WhatsApp packages as physical bundled plugins so Doctor
+# does not install an older plugin generation into the persistent state volume.
+# Finish the official lifecycle first; deferred cleanup would prune added files.
 COPY migration/package.json migration/package-lock.json /opt/openclaw-bridge/
 RUN npm ci --prefix /opt/openclaw-bridge --omit=dev \
+  && node /opt/openclaw-bridge/node_modules/openclaw/scripts/postinstall-bundled-plugins.mjs \
+  && node -e 'const fs=require("node:fs"); for (const id of ["codex","whatsapp"]) fs.cpSync("/opt/openclaw-bridge/node_modules/@openclaw/"+id,"/opt/openclaw-bridge/node_modules/openclaw/dist/extensions/"+id,{recursive:true,dereference:true});' \
   && npm cache clean --force
 
 WORKDIR /app

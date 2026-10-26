@@ -50,6 +50,18 @@ console.log(`Control UI, WhatsApp and Codex manifests present; native Codex star
 const bridgeEntry = "/opt/openclaw-bridge/node_modules/openclaw/openclaw.mjs";
 const bridgePackage = JSON.parse(fs.readFileSync(path.join(path.dirname(bridgeEntry), "package.json"), "utf8"));
 assert.equal(bridgePackage.version, "2026.9.5");
+assert.equal(fs.existsSync(path.join(path.dirname(bridgeEntry), ".openclaw-lifecycle-pending")), false,
+  "Bridge package lifecycle must finish before extra official plugins are bundled");
 const bridgeVersion = run("node", [bridgeEntry, "--version"]);
 assert.ok(bridgeVersion.includes(bridgePackage.version));
+for (const id of ["codex", "whatsapp"]) {
+  const directory = path.join(path.dirname(bridgeEntry), "dist/extensions", id);
+  const plugin = JSON.parse(fs.readFileSync(path.join(directory, "package.json"), "utf8"));
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory, "openclaw.plugin.json"), "utf8"));
+  assert.equal(plugin.version, bridgePackage.version);
+  assert.equal(manifest.id, id);
+  for (const runtime of plugin.openclaw.runtimeExtensions) {
+    assert.ok(fs.statSync(path.resolve(directory, runtime)).size > 0);
+  }
+}
 console.log(`Isolated legacy migration bridge starts: ${bridgeVersion}`);

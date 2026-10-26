@@ -20,7 +20,7 @@ function docker(args, { allowFailure = false, timeout = 180_000 } = {}) {
     assert.equal(result.error, undefined, result.error?.message);
     assert.equal(result.status, 0, result.stderr || result.stdout || "Docker command failed");
   }
-  return result.stdout?.trim() || "";
+  return (args[0] === "logs" ? `${result.stdout || ""}\n${result.stderr || ""}` : result.stdout)?.trim() || "";
 }
 function inContainer(script) {
   return docker(["exec", name, "node", "--input-type=module", "-e", script]);
@@ -103,8 +103,18 @@ async function check(base) {
       assert.equal(db.prepare("SELECT value FROM memory_index_meta WHERE key = ?").get("railway_smoke_legacy_import")?.value,
         "fixture-preserved", "Legacy SQLite memory metadata must be imported into the canonical agent store");
     } finally { db.close(); }
+    const stateDb = new DatabaseSync("/data/.openclaw/state/openclaw.sqlite", { readOnly: true });
+    try {
+      const row = stateDb.prepare("SELECT value_json FROM config_machine_state WHERE state_key = ?").get("plugins.installedIndex");
+      assert.ok(row, "Canonical plugin index is missing");
+      const index = JSON.parse(row.value_json).index;
+      assert.equal(Object.keys(index.installRecords ?? {}).length, 0, "Migration created external plugin install records");
+      assert.ok(!index.plugins.some(plugin => plugin.rootDir?.includes("/opt/openclaw-bridge") ||
+        (["codex", "whatsapp"].includes(plugin.pluginId) && plugin.packageVersion === "2026.9.5")),
+        "Canonical plugin inventory still refers to the migration bridge");
+    } finally { stateDb.close(); }
     const config = JSON.parse(fs.readFileSync("/data/.openclaw/openclaw.json", "utf8"));
-    assert.equal(config.channels.whatsapp.enabled, false);
+    assert.equal(config.channels.whatsapp.enabled, true);
     assert.equal(config.channels.whatsapp.dmPolicy, "allowlist");
     assert.deepEqual(config.channels.whatsapp.allowFrom, ["+15555550123"]);
     assert.equal(config.channels.whatsapp.groupPolicy, "disabled");
@@ -128,7 +138,7 @@ try {
         auth: { mode: "token", token: process.env.OPENCLAW_GATEWAY_TOKEN },
         controlUi: { allowedOrigins: ["http://localhost:3210"] } },
       agents: { defaults: { workspace: "/data/workspace", model: { primary: "openai-codex/gpt-5.5" } } },
-      channels: { whatsapp: { enabled: false, dmPolicy: "allowlist", allowFrom: ["+15555550123"], groupPolicy: "disabled" } }
+      channels: { whatsapp: { enabled: true, dmPolicy: "allowlist", allowFrom: ["+15555550123"], groupPolicy: "disabled" } }
     }));
     fs.mkdirSync("/data/.openclaw/credentials/whatsapp/default", { recursive: true });
     fs.mkdirSync("/data/.openclaw/agents/main/agent", { recursive: true });
@@ -150,6 +160,11 @@ try {
     memoryDb.close();
   `;
   docker(["run", "--rm", "--network", "none", ...env, "-v", `${volume}:/data`, "--entrypoint", "node", image, "-e", seed]);
+  // Real legacy migration must finish with no network, even with WhatsApp
+  // configured. Both release cohorts ship their required plugins in the image.
+  docker(["run", "--rm", "--name", `${name}-migration`, "--network", "none", ...env, "-v", `${volume}:/data`, "--entrypoint", "node", image,
+    "--input-type=module", "-e", 'import { migrateState } from "./scripts/migrate-state.mjs"; await migrateState();'], { timeout: 300_000 });
+  console.log("Offline legacy migration with enabled, unpaired WhatsApp passed.");
   docker(["run", "-d", "--name", name, ...env, "-p", "127.0.0.1::3210", "-v", `${volume}:/data`, image]);
   started = true;
   const address = docker(["port", name, "3210/tcp"]).split("\n")[0];
@@ -172,7 +187,10 @@ try {
   `;
   const before = inContainer(stateHashScript);
   docker(["restart", "--time", "30", name]);
-  await check(base);
+  // Docker can allocate a new host port when restarting a container whose
+  // published host port was left ephemeral.
+  const restartedAddress = docker(["port", name, "3210/tcp"]).split("\n")[0];
+  await check(`http://${restartedAddress}`);
   assert.equal(inContainer(stateHashScript), before, "State changed across container restart");
   console.log("Legacy migration/backup, real gateway/RPC, protected UI bootstrap, injected port and volume restart smoke passed.");
   console.log("No model request or WhatsApp message was sent; those require production account verification.");
@@ -182,8 +200,12 @@ try {
     const logs = docker(["logs", "--tail", "120", name], { allowFailure: true });
     console.error(logs.split(token).join("[redacted]").split(password).join("[redacted]"));
   }
+  const stage = docker(["run", "--rm", "--network", "none", "-v", `${volume}:/data`, "--entrypoint", "node", image,
+    "-e", 'const fs=require("node:fs"); const file="/data/backups/openclaw-2026.10.7-from-prejuly/journal.json"; console.log("Migration stage:",fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")).stage:"not started");'], { allowFailure: true });
+  console.error(stage);
   throw error;
 } finally {
   if (started) docker(["rm", "-f", name], { allowFailure: true });
+  docker(["rm", "-f", `${name}-migration`], { allowFailure: true });
   docker(["volume", "rm", volume], { allowFailure: true });
 }
