@@ -13,8 +13,8 @@ COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 RUN corepack enable
 
 WORKDIR /openclaw
-ARG OPENCLAW_GIT_REF=v2026.10.7
-ARG OPENCLAW_GIT_SHA=157d8c2bc3ea2fa183afdc11088e69690bf8e64e
+ARG OPENCLAW_GIT_REF=v2026.11.6
+ARG OPENCLAW_GIT_SHA=06afb10d3272cc9deaf38ca6a3b7b839d5935638
 RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git . \
   && test "$(git rev-parse HEAD)" = "${OPENCLAW_GIT_SHA}"
 
